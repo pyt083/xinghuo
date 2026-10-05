@@ -504,19 +504,41 @@ function bindOptionRow(rowId, onChange) {
     if (onChange) onChange();
   });
 }
-var RES_MAP = {
-  '16:9': [1344, 768],
-  '9:16': [768, 1344],
-  '1:1':  [768, 768]
-};
+var SAFE_FRAMES_FULL_RES = 150;
+function durationToFrames(d) {
+  var base = Math.max(5, Math.round(d * 24));
+  return base + ((5 - (base % 17)) % 17);
+}
+function computeRes(aspect, duration) {
+  var p = aspect.split(':');
+  var wr = parseInt(p[0], 10), hr = parseInt(p[1], 10);
+  var lr = Math.max(wr, hr) / Math.min(wr, hr);
+  var short = 768;
+  var frames = durationToFrames(parseFloat(duration));
+  if (frames > SAFE_FRAMES_FULL_RES) {
+    var budget = SAFE_FRAMES_FULL_RES * 768 * 1344;
+    var ms = Math.floor(Math.sqrt(budget / (frames * lr)) / 32) * 32;
+    short = Math.max(448, Math.min(768, ms));
+  }
+  var long = Math.min(1344, Math.ceil(short * lr / 32) * 32);
+  return wr >= hr ? [long, short] : [short, long];
+}
+function currentDuration() {
+  var el = document.querySelector('input[name="duration"]:checked');
+  return el ? el.value : 5;
+}
 function currentAspect() {
   return document.querySelector('input[name="aspect"]:checked').value;
 }
-bindOptionRow('duration-row', null);
-bindOptionRow('aspect-row', function () {
-  var r = RES_MAP[currentAspect()];
-  $('res-hint').textContent = '分辨率：' + r[0] + ' × ' + r[1] + '（短边 768，模型原生 768p 档）';
-});
+function updateResHint() {
+  var r = computeRes(currentAspect(), currentDuration());
+  var frames = durationToFrames(parseFloat(currentDuration()));
+  var suffix = frames > SAFE_FRAMES_FULL_RES ? '，长时长已自动降分辨率保证稳定生成' : '，模型原生 768p 档';
+  $('res-hint').textContent = '分辨率：' + r[0] + ' × ' + r[1] + '（' + suffix + '）';
+}
+bindOptionRow('duration-row', updateResHint);
+bindOptionRow('aspect-row', updateResHint);
+updateResHint();
 
 /* ============================ 健康检查 ============================ */
 function loadHealth() {
