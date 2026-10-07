@@ -437,6 +437,45 @@ function openBackendDialog() {
   BACKEND = v;
   loadHealth();
 }
+/* 换实例无痛化：后端地址托管在仓库 backend.json 里，每次打开页面自动拉取最新值，
+   并对「本地记住的地址」和「远端配置的地址」逐一做健康检查，自动切换到可用的那个。 */
+function fetchRemoteBackend() {
+  return fetch('backend.json?ts=' + Date.now(), { cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (j) { return (j && j.backend) ? String(j.backend).replace(/\/+$/, '') : ''; })
+    .catch(function () { return ''; });
+}
+function checkBackendHealth(url) {
+  return fetch(url + '/api/health', { cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (h) { return !!(h && typeof h === 'object' && 'comfy' in h); })
+    .catch(function () { return false; });
+}
+function resolveBackend() {
+  var saved = BACKEND;
+  return fetchRemoteBackend().then(function (remote) {
+    var candidates = [];
+    if (saved && candidates.indexOf(saved) === -1) candidates.push(saved);
+    if (remote && candidates.indexOf(remote) === -1) candidates.push(remote);
+    var i = 0;
+    function tryNext() {
+      if (i >= candidates.length) {
+        BACKEND = saved || remote; // 都不通时保留配置（可能只是实例关机中）
+        return Promise.resolve(false);
+      }
+      var url = candidates[i++];
+      return checkBackendHealth(url).then(function (ok) {
+        if (ok) {
+          BACKEND = url;
+          try { localStorage.setItem('xinghuo_backend', url); } catch (e) {}
+          return true;
+        }
+        return tryNext();
+      });
+    }
+    return tryNext();
+  });
+}
 'use strict';
 /* ============================ 示例提示词（符合官方 prompt 指南：场景 + 分镜/运镜 + 伴随音频） ============================ */
 var EXAMPLE_PROMPTS = [
@@ -542,13 +581,16 @@ updateResHint();
 
 /* ============================ 健康检查 ============================ */
 function loadHealth() {
-  if (!BACKEND && location.protocol.startsWith('http') && location.pathname !== '/') {
-    $('health-box').innerHTML =
-      '<span class="badge err"><span class="dot"></span>未连接生成服务</span>' +
-      '<span class="badge">点右上角「⚙ 服务设置」填入生成服务地址</span>';
-    return;
-  }
-  fetch(api('/api/health')).then(function (r) { return r.json(); }).then(function (h) {
+  $('health-box').innerHTML =
+    '<span class="badge"><span class="dot"></span>正在连接生成服务…</span>';
+  resolveBackend().then(function (ok) {
+    if (!ok) {
+      $('health-box').innerHTML =
+        '<span class="badge err"><span class="dot"></span>服务异常</span>' +
+        '<span class="badge">生成服务未开机或地址待更新；可点右上角「⚙ 服务设置」手动填入</span>';
+      return;
+    }
+    fetch(api('/api/health')).then(function (r) { return r.json(); }).then(function (h) {
     var box = $('health-box');
     var html = '';
     if (h.mock) {
@@ -563,9 +605,11 @@ function loadHealth() {
       html += '<span class="badge">' + esc(h.gpu.name) + vram + '</span>';
     }
     box.innerHTML = html;
-  }).catch(function () {
-    $('health-box').innerHTML =
-      '<span class="badge err"><span class="dot"></span>服务异常</span>';
+      })
+      .catch(function () {
+        $('health-box').innerHTML =
+          '<span class="badge err"><span class="dot"></span>服务异常</span>';
+      });
   });
 }
 
