@@ -868,15 +868,24 @@ function ghApi(path, opts) {
 }
 function loadSodium(cb) {
   if (window._sodium) { cb(window._sodium); return; }
-  var s = document.createElement('script');
-  s.src = 'https://registry.npmmirror.com/libsodium-wrappers/0.7.15/files/dist/browsers/sodium.js';
-  s.onload = function () {
-    window.sodium.ready.then(function () { window._sodium = window.sodium; cb(window.sodium); });
-  };
-  s.onerror = function () {
-    depStatus('加密库加载失败，请检查网络后重试', true);
-  };
-  document.head.appendChild(s);
+  var urls = [
+    'https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.15/+esm',
+    'https://esm.sh/libsodium-wrappers@0.7.15',
+    'https://unpkg.com/libsodium-wrappers@0.7.15/+esm'
+  ];
+  function tryNext(i) {
+    if (i >= urls.length) {
+      depStatus('加密库加载失败（网络原因），请稍后重试；或把 SSH 登录指令和密码直接发给 WorkBuddy 助手部署', true);
+      var btn = document.getElementById('dep-go');
+      btn.disabled = false; btn.textContent = '开始部署';
+      return;
+    }
+    import(urls[i]).then(function (mod) {
+      var s = mod.default || mod;
+      return s.ready.then(function () { window._sodium = s; cb(s); });
+    }).catch(function (e) { tryNext(i + 1); });
+  }
+  tryNext(0);
 }
 function startDeploy() {
   var login = document.getElementById('dep-login').value.trim();
@@ -893,8 +902,15 @@ function startDeploy() {
   btn.disabled = true; btn.textContent = '部署中…';
   depStatus('正在向 GitHub 提交部署任务…');
   loadSodium(function (sodium) {
+    function apiError(prefix) {
+      return function (r) {
+        return r.json().catch(function () { return {}; }).then(function (j) {
+          throw new Error(prefix + ' HTTP ' + r.status + (j && j.message ? '：' + j.message : ''));
+        });
+      };
+    }
     ghApi('/actions/secrets/public-key').then(function (r) {
-      if (!r.ok) throw new Error('读取仓库密钥失败 HTTP ' + r.status + '（Token 权限需含 repo）');
+      if (!r.ok) return apiError('读取仓库密钥失败（Token 需勾选 repo 权限且未过期）')(r);
       return r.json();
     }).then(function (pk) {
       var enc = sodium.to_base64(
@@ -904,16 +920,18 @@ function startDeploy() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ encrypted_value: enc, key_id: pk.key_id })
+      }).then(function (r) {
+        if (r.status !== 201 && r.status !== 204) return apiError('写入密钥失败')(r);
       });
-    }).then(function (r) {
-      if (r.status !== 201 && r.status !== 204) throw new Error('写入密钥失败 HTTP ' + r.status);
+    }).then(function () {
       return ghApi('/actions/workflows/deploy.yml/dispatches', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ref: 'main' })
+      }).then(function (r) {
+        if (r.status !== 204) return apiError('触发部署失败')(r);
       });
-    }).then(function (r) {
-      if (r.status !== 204) throw new Error('触发部署失败 HTTP ' + r.status);
+    }).then(function () {
       depStatus('✅ 部署任务已提交到 GitHub Actions 云端执行！正在跟踪进度…');
       pollDeployRun(0);
     }).catch(function (e) {
