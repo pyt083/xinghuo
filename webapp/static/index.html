@@ -316,7 +316,6 @@ textarea:focus, input:focus {
         <div class="brand-sub">文字生成带立体声音频的 AI 视频 · Powered by MiniMax H3</div>
       </div>
     </div>
-    <a href="#" id="backend-set-btn" onclick="openBackendDialog();return false;" style="font-size:12px;color:var(--brand);text-decoration:none;font-weight:600">⚙ 服务设置</a>
     <div class="health" id="health-box">
       <span class="badge"><span class="dot"></span>服务检测中…</span>
     </div>
@@ -408,23 +407,6 @@ textarea:focus, input:focus {
   </div>
 </main>
 
-<!-- ============================ 换实例部署向导 ============================ -->
-<section class="container" id="deploy-guide" style="max-width:960px;margin:24px auto 0;padding:0 16px">
-  <details style="background:var(--panel,#f7f7f9);border:1px solid var(--border,#e5e5ea);border-radius:14px;padding:14px 18px">
-    <summary style="cursor:pointer;font-weight:700;font-size:15px">🚀 换了新实例？点这里看自动部署向导（3 步恢复，无需联系任何人）</summary>
-    <div style="margin-top:12px;font-size:13.5px;line-height:2">
-      <b>原理</b>：本站部署脚本托管在 GitHub 仓库里，由 GitHub Actions 云端自动执行；实例的连接信息保存在仓库的「加密变量」中，密码不会泄露。
-      <ol style="padding-left:20px;margin:8px 0">
-        <li>打开 <a href="https://github.com/pyt083/xinghuo/settings/variables/actions" target="_blank" rel="noopener">仓库变量设置</a>，更新变量 <code>SSH_LOGIN</code> 为新实例的「主机:端口」（如 <code>connect.westb.seetacloud.com:13144</code>）</li>
-        <li>打开 <a href="https://github.com/pyt083/xinghuo/settings/secrets/actions" target="_blank" rel="noopener">仓库密码设置</a>，更新加密密钥 <code>SSH_PASSWORD</code> 为新实例的 SSH 密码</li>
-        <li>等实例状态为「运行中」即可 —— 系统每 15 分钟自动检测并部署；想立即执行可到 <a href="https://github.com/pyt083/xinghuo/actions/workflows/deploy.yml" target="_blank" rel="noopener">Actions 页面</a> 手动运行「一键部署星火后端」</li>
-      </ol>
-      <b>最后一步</b>：部署完成后，到 AutoDL 控制台「自定义服务」复制新链接，点本页右上角「⚙ 服务设置」粘贴保存（只需一次，本设备会记住）。
-      <div style="margin-top:6px;color:var(--text-3,#888)">全新空实例首次部署约需 20-60 分钟（自动下载 41GB 模型）；迁移/克隆实例约 2 分钟。执行进度可在 Actions 页面实时查看。</div>
-    </div>
-  </details>
-</section>
-
 <!-- ============================ 页脚 ============================ -->
 <footer class="site-footer">
   <div class="container">
@@ -436,63 +418,6 @@ textarea:focus, input:focus {
 <div id="toast-box"></div>
 
 <script>
-
-/* ============================ 后端服务地址配置（GitHub Pages 独立部署用） ============================ */
-var BACKEND = '';
-try { BACKEND = localStorage.getItem('xinghuo_backend') || ''; } catch (e) { BACKEND = ''; }
-function api(path) {
-  if (BACKEND) { return BACKEND.replace(/\/+$/, '') + path; }
-  return path;
-}
-function openBackendDialog() {
-  var cur = '';
-  try { cur = localStorage.getItem('xinghuo_backend') || ''; } catch (e) {}
-  var v = window.prompt('请输入星火生成服务的地址（AutoDL 控制台「自定义服务」里的链接）：\n例如 https://xxxx.weste.seetacloud.com:8443', cur);
-  if (v === null) { return; }
-  v = v.trim();
-  try { localStorage.setItem('xinghuo_backend', v); } catch (e) {}
-  BACKEND = v;
-  loadHealth();
-}
-/* 换实例无痛化：后端地址托管在仓库 backend.json 里，每次打开页面自动拉取最新值，
-   并对「本地记住的地址」和「远端配置的地址」逐一做健康检查，自动切换到可用的那个。 */
-function fetchRemoteBackend() {
-  return fetch('backend.json?ts=' + Date.now(), { cache: 'no-store' })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (j) { return (j && j.backend) ? String(j.backend).replace(/\/+$/, '') : ''; })
-    .catch(function () { return ''; });
-}
-function checkBackendHealth(url) {
-  return fetch(url + '/api/health', { cache: 'no-store' })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (h) { return !!(h && typeof h === 'object' && 'comfy' in h); })
-    .catch(function () { return false; });
-}
-function resolveBackend() {
-  var saved = BACKEND;
-  return fetchRemoteBackend().then(function (remote) {
-    var candidates = [];
-    if (saved && candidates.indexOf(saved) === -1) candidates.push(saved);
-    if (remote && candidates.indexOf(remote) === -1) candidates.push(remote);
-    var i = 0;
-    function tryNext() {
-      if (i >= candidates.length) {
-        BACKEND = saved || remote; // 都不通时保留配置（可能只是实例关机中）
-        return Promise.resolve(false);
-      }
-      var url = candidates[i++];
-      return checkBackendHealth(url).then(function (ok) {
-        if (ok) {
-          BACKEND = url;
-          try { localStorage.setItem('xinghuo_backend', url); } catch (e) {}
-          return true;
-        }
-        return tryNext();
-      });
-    }
-    return tryNext();
-  });
-}
 'use strict';
 /* ============================ 示例提示词（符合官方 prompt 指南：场景 + 分镜/运镜 + 伴随音频） ============================ */
 var EXAMPLE_PROMPTS = [
@@ -598,16 +523,7 @@ updateResHint();
 
 /* ============================ 健康检查 ============================ */
 function loadHealth() {
-  $('health-box').innerHTML =
-    '<span class="badge"><span class="dot"></span>正在连接生成服务…</span>';
-  resolveBackend().then(function (ok) {
-    if (!ok) {
-      $('health-box').innerHTML =
-        '<span class="badge err"><span class="dot"></span>服务异常</span>' +
-        '<span class="badge">生成服务未开机或地址待更新；可点右上角「⚙ 服务设置」手动填入</span>';
-      return;
-    }
-    fetch(api('/api/health')).then(function (r) { return r.json(); }).then(function (h) {
+  fetch('/api/health').then(function (r) { return r.json(); }).then(function (h) {
     var box = $('health-box');
     var html = '';
     if (h.mock) {
@@ -622,11 +538,9 @@ function loadHealth() {
       html += '<span class="badge">' + esc(h.gpu.name) + vram + '</span>';
     }
     box.innerHTML = html;
-      })
-      .catch(function () {
-        $('health-box').innerHTML =
-          '<span class="badge err"><span class="dot"></span>服务异常</span>';
-      });
+  }).catch(function () {
+    $('health-box').innerHTML =
+      '<span class="badge err"><span class="dot"></span>服务异常</span>';
   });
 }
 
@@ -651,7 +565,7 @@ $('btn-generate').addEventListener('click', function () {
   btn.disabled = true;
   btn.textContent = '提交中…';
 
-  fetch(api('/api/generate'), {
+  fetch('/api/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: prompt, duration: duration, aspect: aspect, seed: seed })
@@ -686,7 +600,7 @@ function stopPolling() {
 }
 
 function pollStatus(taskId) {
-  fetch(api('/api/status/' + taskId))
+  fetch('/api/status/' + taskId)
   .then(function (r) {
     return r.json().then(function (body) { return { ok: r.ok, body: body }; });
   })
@@ -748,7 +662,7 @@ window.retryFromHistory = function () {
 };
 
 function showVideo(t) {
-  var url = api('/api/video/' + t.task_id);
+  var url = '/api/video/' + t.task_id;
   var html = '' +
     '<div class="video-wrap" style="flex:1;display:flex;flex-direction:column">' +
       '<video controls autoplay playsinline src="' + url + '"></video>' +
@@ -774,7 +688,7 @@ function showVideo(t) {
 /* ============================ 历史记录 ============================ */
 var HISTORY_REFRESH_MS = 10000;
 function loadTasks() {
-  fetch(api('/api/tasks'))
+  fetch('/api/tasks')
   .then(function (r) { return r.json(); })
   .then(function (data) { renderTasks(data.tasks || []); })
   .catch(function () { /* 静默失败，避免打扰 */ });
@@ -812,7 +726,7 @@ function renderTasks(tasks) {
   Array.prototype.forEach.call(grid.querySelectorAll('.task-card'), function (card) {
     card.addEventListener('click', function () {
       var id = card.getAttribute('data-task');
-      fetch(api('/api/status/' + id)).then(function (r) { return r.json(); }).then(function (t) {
+      fetch('/api/status/' + id).then(function (r) { return r.json(); }).then(function (t) {
         if (t.status === 'done') {
           showVideo(t);
           window.scrollTo({ top: 0, behavior: 'smooth' });

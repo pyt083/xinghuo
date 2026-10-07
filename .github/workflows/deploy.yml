@@ -1,0 +1,132 @@
+name: 一键部署星火后端
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_login:
+        description: 'SSH 登录信息（主机:端口），留空则使用仓库变量 SSH_LOGIN'
+        required: false
+        default: ''
+      service_url:
+        description: '自定义服务 URL（可选：AutoDL 控制台「自定义服务」的链接，填写后会自动更新到网站）'
+        required: false
+        default: ''
+  schedule:
+    # 每 15 分钟自愈检测：实例开机后自动部署/启动服务
+    - cron: '*/15 * * * *'
+
+concurrency:
+  group: xinghuo-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    env:
+      SSH_LOGIN: ${{ github.event.inputs.ssh_login || vars.SSH_LOGIN }}
+      SSHPASS: ${{ secrets.SSH_PASSWORD }}
+    steps:
+      - name: 检查配置
+        id: cfg
+        run: |
+          if [ -z "$SSH_LOGIN" ] || [ -z "$SSHPASS" ]; then
+            echo "::notice::未配置 SSH_LOGIN 变量或 SSH_PASSWORD 密钥，跳过本次运行"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 等待实例 SSH 就绪（最长 8 分钟）
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          sudo apt-get install -y -qq sshpass >/dev/null 2>&1 || true
+          HOST="${SSH_LOGIN%%:*}"
+          PORT="${SSH_LOGIN##*:}"
+          if [ "$HOST" = "$PORT" ]; then PORT=22; fi
+          echo "HOST=$HOST" >> "$GITHUB_ENV"
+          echo "PORT=$PORT" >> "$GITHUB_ENV"
+          ok=0
+          for i in $(seq 1 32); do
+            if sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p "$PORT" "root@$HOST" "echo UP" 2>/dev/null | grep -q UP; then
+              ok=1; echo "实例已上线（第 $i 次探测）"; break
+            fi
+            sleep 15
+          done
+          if [ $ok -ne 1 ]; then
+            echo "::notice::实例未上线（可能已关机或正在维护），本次结束"
+            exit 0
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.skip != 'true'
+
+      - name: 上传部署脚本与服务代码
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          SSHC="sshpass -e ssh -o StrictHostKeyChecking=no -p $PORT root@$HOST"
+          SCPC="sshpass -e scp -o StrictHostKeyChecking=no -P $PORT"
+          $SSHC "mkdir -p /root/autodl-tmp/webapp/static /root/autodl-tmp/logs /root/autodl-tmp/outputs"
+          $SCPC deploy/deploy_h3.sh deploy/start_all.sh "root@$HOST:/root/autodl-tmp/"
+          $SCPC webapp/app.py webapp/comfy_bridge.py webapp/workflow.py "root@$HOST:/root/autodl-tmp/webapp/"
+          $SCPC webapp/static/index.html "root@$HOST:/root/autodl-tmp/webapp/static/"
+          $SSHC "sed -i 's/\r$//' /root/autodl-tmp/deploy_h3.sh /root/autodl-tmp/start_all.sh && chmod +x /root/autodl-tmp/start_all.sh"
+
+      - name: 启动服务（已有数据）或全新部署（空实例）
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          SSHC="sshpass -e ssh -o StrictHostKeyChecking=no -p $PORT root@$HOST"
+          if $SSHC "[ -d /root/autodl-tmp/ComfyUI ]" 2>/dev/null; then
+            echo "== 数据盘已有 ComfyUI，直接启动 =="
+            $SSHC "/root/miniconda3/bin/python -c 'import fastapi, uvicorn, requests' 2>/dev/null || /root/miniconda3/bin/pip install -q fastapi uvicorn requests"
+            $SSHC "pkill -9 -f '/root/miniconda3/bin/python app[.]py' 2>/dev/null; true"
+            sleep 2
+            $SSHC "bash /root/autodl-tmp/start_all.sh" || true
+          else
+            echo "== 全新实例：开始完整部署（最长 3 小时）=="
+            $SSHC "nohup bash /root/autodl-tmp/deploy_h3.sh > /root/autodl-tmp/logs/deploy.log 2>&1 < /dev/null & echo BG"
+            for i in $(seq 1 180); do
+              sleep 60
+              if $SSHC "grep -q DEPLOY_DONE /root/autodl-tmp/logs/deploy.log" 2>/dev/null; then
+                echo "== 部署完成（第 $i 分钟）=="
+                $SSHC "/root/miniconda3/bin/pip install -q fastapi uvicorn requests && cd /root/autodl-tmp/webapp && nohup /root/miniconda3/bin/python app.py >> /root/autodl-tmp/logs/webapp.log 2>&1 < /dev/null & sleep 5; echo WEBAPP_UP"
+                break
+              fi
+              if [ $((i % 10)) -eq 0 ]; then
+                echo "-- 进度（第 $i 分钟）--"
+                $SSHC "tail -n 2 /root/autodl-tmp/logs/deploy.log" 2>/dev/null || true
+              fi
+            done
+          fi
+
+      - name: 健康检查
+        if: steps.cfg.outputs.skip != 'true'
+        run: |
+          SSHC="sshpass -e ssh -o StrictHostKeyChecking=no -p $PORT root@$HOST"
+          sleep 20
+          H=$($SSHC "curl -s --max-time 10 http://127.0.0.1:6006/api/health" 2>/dev/null || true)
+          echo "健康检查: $H"
+          if echo "$H" | grep -q '"comfy":true'; then
+            echo "::notice::星火后端已就绪 ✅"
+          else
+            echo "::warning::ComfyUI 可能仍在加载，稍后可在 Actions 重跑本工作流确认"
+          fi
+
+      - name: 更新网站后端地址（可选）
+        if: steps.cfg.outputs.skip != 'true' && github.event.inputs.service_url != ''
+        run: |
+          python3 - <<'EOF'
+          import json
+          url = """${{ github.event.inputs.service_url }}""".strip().rstrip('/')
+          with open("backend.json", "w", encoding="utf-8") as f:
+              json.dump({"backend": url}, f, ensure_ascii=False, indent=2)
+          print("backend.json ->", url)
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend.json
+          git commit -m "chore: 自动切换后端地址到新实例" || exit 0
+          git push
