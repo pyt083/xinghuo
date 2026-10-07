@@ -316,6 +316,7 @@ textarea:focus, input:focus {
         <div class="brand-sub">文字生成带立体声音频的 AI 视频 · Powered by MiniMax H3</div>
       </div>
     </div>
+    <a href="#" id="deploy-btn" onclick="openDeployDialog();return false;" style="font-size:12px;color:var(--brand);text-decoration:none;font-weight:600;margin-right:14px">🚀 一键部署</a>
     <a href="#" id="backend-set-btn" onclick="openBackendDialog();return false;" style="font-size:12px;color:var(--brand);text-decoration:none;font-weight:600">⚙ 服务设置</a>
     <div class="health" id="health-box">
       <span class="badge"><span class="dot"></span>服务检测中…</span>
@@ -836,6 +837,152 @@ $('btn-refresh').addEventListener('click', function () { loadTasks(); toast('已
 /* ============================ 启动 ============================ */
 loadHealth();
 loadTasks();
+
+/* ============================ 一键部署（GitHub Actions 云端部署新实例） ============================ */
+var REPO = 'pyt083/xinghuo';
+function openDeployDialog() {
+  var d = document.getElementById('deploy-modal');
+  d.style.display = 'flex';
+  try {
+    document.getElementById('dep-pat').value = localStorage.getItem('xinghuo_pat') || '';
+  } catch (e) {}
+}
+function closeDeployDialog() {
+  document.getElementById('deploy-modal').style.display = 'none';
+}
+function depStatus(html, isErr) {
+  var el = document.getElementById('dep-status');
+  el.style.display = 'block';
+  el.style.color = isErr ? '#e5484d' : 'var(--brand)';
+  el.innerHTML = html;
+}
+function ghApi(path, opts) {
+  var pat = document.getElementById('dep-pat').value.trim();
+  return fetch('https://api.github.com/repos/' + REPO + path,
+    Object.assign({}, opts, {
+      headers: Object.assign({
+        'Authorization': 'token ' + pat,
+        'Accept': 'application/vnd.github+json'
+      }, (opts && opts.headers) || {})
+    }));
+}
+function loadSodium(cb) {
+  if (window._sodium) { cb(window._sodium); return; }
+  var s = document.createElement('script');
+  s.src = 'https://registry.npmmirror.com/libsodium-wrappers/0.7.15/files/dist/browsers/sodium.js';
+  s.onload = function () {
+    window.sodium.ready.then(function () { window._sodium = window.sodium; cb(window.sodium); });
+  };
+  s.onerror = function () {
+    depStatus('加密库加载失败，请检查网络后重试', true);
+  };
+  document.head.appendChild(s);
+}
+function startDeploy() {
+  var login = document.getElementById('dep-login').value.trim();
+  var pass = document.getElementById('dep-pass').value;
+  var url = document.getElementById('dep-url').value.trim();
+  var pat = document.getElementById('dep-pat').value.trim();
+  if (!login || !pass) { depStatus('请填写 SSH 登录指令和密码', true); return; }
+  if (!pat) { depStatus('请填写 GitHub Token（创建一次后本机会自动记住）', true); return; }
+  var m = login.match(/-p\s*(\d+)\s+[\w.-]+@([\w.-]+)/) || login.match(/(\d+)\s+[\w.-]+@([\w.-]+)/);
+  if (!m) { depStatus('登录指令格式无法识别，应为：ssh -p 端口 root@主机', true); return; }
+  try { localStorage.setItem('xinghuo_pat', pat); } catch (e) {}
+  var instance = { host: m[2], port: parseInt(m[1], 10), password: pass, service_url: url };
+  var btn = document.getElementById('dep-go');
+  btn.disabled = true; btn.textContent = '部署中…';
+  depStatus('正在向 GitHub 提交部署任务…');
+  loadSodium(function (sodium) {
+    ghApi('/actions/secrets/public-key').then(function (r) {
+      if (!r.ok) throw new Error('读取仓库密钥失败 HTTP ' + r.status + '（Token 权限需含 repo）');
+      return r.json();
+    }).then(function (pk) {
+      var enc = sodium.to_base64(
+        sodium.crypto_box_seal(JSON.stringify(instance), sodium.from_base64(pk.key, sodium.base64_variants.ORIGINAL)),
+        sodium.base64_variants.ORIGINAL);
+      return ghApi('/actions/secrets/INSTANCE_JSON', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ encrypted_value: enc, key_id: pk.key_id })
+      });
+    }).then(function (r) {
+      if (r.status !== 201 && r.status !== 204) throw new Error('写入密钥失败 HTTP ' + r.status);
+      return ghApi('/actions/workflows/deploy.yml/dispatches', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: 'main' })
+      });
+    }).then(function (r) {
+      if (r.status !== 204) throw new Error('触发部署失败 HTTP ' + r.status);
+      depStatus('✅ 部署任务已提交到 GitHub Actions 云端执行！正在跟踪进度…');
+      pollDeployRun(0);
+    }).catch(function (e) {
+      depStatus('部署提交失败：' + e.message, true);
+      btn.disabled = false; btn.textContent = '开始部署';
+    });
+  });
+}
+function pollDeployRun(round) {
+  setTimeout(function () {
+    ghApi('/actions/runs?event=workflow_dispatch&per_page=1').then(function (r) { return r.json(); }).then(function (j) {
+      var run = j.workflow_runs && j.workflow_runs[0];
+      if (!run) { depStatus('正在等待云端任务启动…'); pollDeployRun(round + 1); return; }
+      var state = run.status === 'completed' ? run.conclusion : run.status;
+      var txt = '云端部署' + (state === 'in_progress' ? '进行中' : state === 'queued' ? '排队中' :
+        state === 'success' ? '✅ 完成！网站 1 分钟内自动连接新实例' : '❌ ' + state + '，') +
+        ' <a href="' + run.html_url + '" target="_blank" style="color:var(--brand)">查看日志</a>';
+      depStatus(txt);
+      if (run.status === 'completed') {
+        var btn = document.getElementById('dep-go');
+        btn.disabled = false; btn.textContent = '开始部署';
+        if (run.conclusion === 'success') { loadHealth(); loadTasks(); }
+        return;
+      }
+      pollDeployRun(round + 1);
+    }).catch(function () { pollDeployRun(round + 1); });
+  }, 8000);
+}
 </script>
+
+<!-- 一键部署弹窗 -->
+<style>
+#deploy-modal { position: fixed; inset: 0; background: rgba(15,18,36,.55); display: none;
+  align-items: center; justify-content: center; z-index: 99; padding: 16px; }
+.deploy-card { background: #fff; border-radius: 14px; max-width: 560px; width: 100%;
+  padding: 22px 24px; box-shadow: 0 24px 60px rgba(20,25,60,.25); max-height: 90vh; overflow-y: auto; }
+.deploy-card h3 { margin: 0 0 4px; font-size: 17px; }
+.deploy-card .desc { font-size: 12px; color: #8a90a8; margin-bottom: 14px; line-height: 1.6; }
+.deploy-card label { display: block; font-size: 12px; font-weight: 600; margin: 10px 0 4px; }
+.deploy-card input { width: 100%; box-sizing: border-box; border: 1px solid #dcdfee; border-radius: 8px;
+  padding: 8px 10px; font-size: 13px; }
+.deploy-card .row { display: flex; gap: 10px; }
+#dep-go { margin-top: 16px; width: 100%; border: 0; border-radius: 10px; padding: 11px;
+  background: linear-gradient(135deg, #6d5cff, #4b7bff); color: #fff; font-size: 14px; font-weight: 700; cursor: pointer; }
+#dep-go:disabled { opacity: .6; cursor: not-allowed; }
+#dep-status { display: none; margin-top: 12px; font-size: 12px; line-height: 1.7; word-break: break-all; }
+.dep-close { float: right; border: 0; background: none; font-size: 18px; cursor: pointer; color: #999; }
+</style>
+<div id="deploy-modal" onclick="if(event.target===this)closeDeployDialog()">
+  <div class="deploy-card">
+    <button class="dep-close" onclick="closeDeployDialog()">×</button>
+    <h3>🚀 一键部署新实例</h3>
+    <div class="desc">换新实例后在这里填入登录信息，云端（GitHub Actions）自动完成：服务启动或全新部署（全新实例约 20-60 分钟）→ 更新网站后端地址。整个过程不需要开着电脑，关闭本弹窗也不影响。</div>
+    <label>SSH 登录指令（AutoDL 控制台复制）</label>
+    <input id="dep-login" placeholder="例如：ssh -p 13144 root@connect.westb.seetacloud.com">
+    <div class="row">
+      <div style="flex:1">
+        <label>SSH 密码</label>
+        <input id="dep-pass" type="password" placeholder="实例密码">
+      </div>
+    </div>
+    <label>「自定义服务」链接（可选，AutoDL 控制台「快捷工具 → 自定义服务」复制）</label>
+    <input id="dep-url" placeholder="例如：https://xxxx.westb.seetacloud.com:8443">
+    <label>GitHub Token（<a href="https://github.com/settings/tokens/new?scopes=repo&description=xinghuo-deploy" target="_blank" style="color:var(--brand)">点此创建</a>，勾选 repo 权限，创建一次即可）</label>
+    <input id="dep-pat" type="password" placeholder="ghp_ 或 github_pat_ 开头">
+    <button id="dep-go" onclick="startDeploy()">开始部署</button>
+    <div id="dep-status"></div>
+  </div>
+</div>
+
 </body>
 </html>
