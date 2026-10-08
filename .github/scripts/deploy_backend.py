@@ -8,7 +8,8 @@
      云端只用「短探测」轮询状态 —— 连接中断几分钟也不影响服务器端推进。
   3. 失败原因（异常类型+消息）写入 ::error:: 首行与 GitHub Step Summary，
      在 Actions 页面即可直接看到失败原因，无需下载日志。
-  4. 服务器端部署锁，防止并行部署互相干扰（连续点多次部署）。
+  4. 服务器端部署锁：以「是否有 deploy_h3.sh 进程在跑」为准，跑着就等它
+     完成；锁在 finally 中兜底释放，失败不会卡死下次部署。
 """
 import base64
 import json
@@ -147,44 +148,20 @@ def fail(msg):
     sys.exit(1)
 
 
-def main():
-    global _cfg
-    _cfg = json.loads(os.environ.get("INSTANCE_JSON") or "{}")
-    host = _cfg.get("host")
-    port = int(_cfg.get("port") or 22)
-    _cfg["port"] = port
-    password = _cfg.get("password") or ""
-    service_url = (_cfg.get("service_url") or "").strip()
-    if not (host and password):
-        fail("INSTANCE_JSON 缺少 host/password，请在网站重新填写实例信息")
-
-    # ---- 1. 等待 SSH 就绪（实例可能刚开机，最长约 10 分钟）----
-    connected = False
-    for attempt in range(20):
-        try:
-            connect()
-            connected = True
-            break
-        except Exception as e:
-            log(f"等待 SSH 就绪 ({attempt + 1}/20): {type(e).__name__}: {e}")
-            time.sleep(20)
-    if not connected:
-        fail("10 分钟内无法连接实例。请确认：① 控制台状态为「运行中」② SSH 指令/密码正确 "
-             "③ 若多次失败可能是海外 runner 无法访问实例，请改用 WorkBuddy 助手本地部署（发送密码即可）")
-
-    # ---- 2. 部署锁（防止连续点击导致并行部署互相干扰）----
+def main_locked():
+    # ---- 3. 环境检查：ComfyUI 与 5 个模型是否齐备（缺则走完整部署）----
     _, out = run(
-        "L=/root/autodl-tmp/.deploy_lock; "
-        "if [ -e $L ]; then A=$(( $(date +%s) - $(stat -c %Y $L) )); else A=99999; fi; "
-        "if [ $A -lt 7200 ]; then echo LOCKED; "
-        "else rm -rf $L; mkdir $L && echo ACQUIRED; fi")
-    if "ACQUIRED" not in out:
-        fail("已有另一个部署正在进行中（请勿连续点击部署），请等它完成或 2 小时后重试")
-
-    # ---- 3. 数据盘检查：全新实例则完整部署（服务器端 nohup + 短探测轮询）----
-    _, out = run("[ -d /root/autodl-tmp/ComfyUI ] && echo YES || echo NO")
+        "if [ -d /root/autodl-tmp/ComfyUI ]; then "
+        "M=/root/autodl-tmp/ComfyUI/models; ok=1; "
+        "for f in diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors "
+        "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors "
+        "vae/minimax_h3_video_vae_int8_convrot.safetensors "
+        "vae/minimax_h3_audio_vae_fp32.safetensors "
+        "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors; do "
+        "[ -s \"$M/$f\" ] || ok=0; done; "
+        "[ \"$ok\" = 1 ] && echo YES || echo PARTIAL; else echo NO; fi")
     if "YES" not in out:
-        log("全新实例：执行完整部署（约 20-60 分钟，服务器端后台进行）")
+        log("需要完整部署（全新实例或模型不齐，约 20-60 分钟，服务器端后台进行）")
         run("mkdir -p /root/autodl-tmp/logs && rm -f /root/autodl-tmp/logs/deploy.log")
         put(os.path.join(REPO_DIR, "deploy", "deploy_h3.sh"),
             "/root/autodl-tmp/deploy_h3.sh")
@@ -203,12 +180,12 @@ def main():
             "grep -q DEPLOY_DONE /root/autodl-tmp/logs/deploy.log 2>/dev/null && echo DEPLOY_TAG_DONE; "
             "grep -qE '失败|BAD ' /root/autodl-tmp/logs/deploy.log 2>/dev/null && echo DEPLOY_TAG_FAIL; "
             "tail -n 1 /root/autodl-tmp/logs/deploy.log 2>/dev/null",
-            deploy_done, "全新部署", attempts=200, interval=20)
+            deploy_done, "完整部署", attempts=200, interval=20)
         if detail is None:
-            fail("全新部署超时（约 66 分钟未完成），请查看服务器 /root/autodl-tmp/logs/deploy.log")
-        log("全新部署完成")
+            fail("完整部署超时（约 66 分钟未完成），请查看服务器 /root/autodl-tmp/logs/deploy.log")
+        log("完整部署完成")
     else:
-        log("数据盘已有 ComfyUI，跳过部署")
+        log("数据盘已有 ComfyUI 和全部模型，走快速启动路径")
 
     # ---- 4. 同步最新后端代码 ----
     for local, remote in [
@@ -241,6 +218,7 @@ def main():
     log("健康检查通过: ComfyUI 在线，星火后端正常")
 
     # ---- 7. 更新 backend.json（网站自动读取最新后端地址）----
+    service_url = (_cfg.get("service_url") or "").strip()
     if service_url:
         token = os.environ["GITHUB_TOKEN"]
         headers = {
@@ -283,9 +261,52 @@ def main():
             fail(f"部署成功但 backend.json 更新失败: {last_err}。"
                  f"可手动在网站把后端地址切换为 {service_url}")
 
-    # ---- 8. 释放部署锁 ----
-    run("rm -rf /root/autodl-tmp/.deploy_lock", timeout=60, retries=2)
     log("部署全部完成 ✅")
+
+
+def main():
+    global _cfg
+    _cfg = json.loads(os.environ.get("INSTANCE_JSON") or "{}")
+    host = _cfg.get("host")
+    port = int(_cfg.get("port") or 22)
+    _cfg["port"] = port
+    password = _cfg.get("password") or ""
+    if not (host and password):
+        fail("INSTANCE_JSON 缺少 host/password，请在网站重新填写实例信息")
+
+    # ---- 1. 等待 SSH 就绪（实例可能刚开机，最长约 10 分钟）----
+    connected = False
+    for attempt in range(20):
+        try:
+            connect()
+            connected = True
+            break
+        except Exception as e:
+            log(f"等待 SSH 就绪 ({attempt + 1}/20): {type(e).__name__}: {e}")
+            time.sleep(20)
+    if not connected:
+        fail("10 分钟内无法连接实例。请确认：① 控制台状态为「运行中」② SSH 指令/密码正确 "
+             "③ 若多次失败可能是海外 runner 无法访问实例，请改用 WorkBuddy 助手本地部署（发送密码即可）")
+
+    # ---- 2. 部署锁：以「服务器端是否有 deploy_h3.sh 在跑」为准 ----
+    def lock_free(out):
+        return "ACQUIRED" in out, out
+
+    detail = wait_for(
+        "pgrep -f 'deploy_h3[.]sh' >/dev/null 2>&1 && echo BUSY || "
+        "{ rm -rf /root/autodl-tmp/.deploy_lock; "
+        "mkdir /root/autodl-tmp/.deploy_lock && echo ACQUIRED; }",
+        lock_free, "部署锁", attempts=220, interval=20, tolerate=30)
+    if detail is None:
+        fail("等待其他部署完成超时（约 70 分钟），请稍后再点一次部署")
+
+    try:
+        main_locked()
+    finally:
+        try:
+            run("rm -rf /root/autodl-tmp/.deploy_lock", timeout=60, retries=2)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
